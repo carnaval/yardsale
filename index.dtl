@@ -1,0 +1,15 @@
+<html>
+<head>
+<title>$page_title</title>
+</head>
+<body>
+<h3>$page_title</h3>
+Hi !
+<ul>
+#(for route in routes)
+   #(route_ast = methods(route[3]).defs.func.code)      
+   <li><pre>$(route[2]) $(route[1])</pre> at $(route_ast.file):$(route_ast.line)</pre></li>
+#(end)
+</ul>
+</body>
+</html>
