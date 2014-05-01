@@ -8,7 +8,10 @@ type Res
     handle :: Ptr{Void}
     ncol :: Int
     singlecol :: Bool # true if explicitely asked one column
+    out_ncol_sum :: Vector{Int}
+    out_types :: Vector{Union(Type,Nothing)}
 end
+Res(c,h,s,out_ncol,out_types) = Res(c,h,sum(out_ncol),s,vcat(0,cumsum(out_ncol)), out_types)
 
 function Base.print(io::IO, r :: Res)
     stat = status(r)
@@ -65,9 +68,12 @@ function finalize(r :: Res)
     ccall((:PQclear, "libpq"), Void, (Ptr{Void},), r.handle)
 end
 
-function pqres(c, r, onecol)
+function pqres(c, r, onecol, out_ncols = nothing,out_types=nothing)
     ncol = ccall((:PQnfields, "libpq"), Int, (Ptr{Void},), r)
-    res = Res(c, r, ncol, onecol)
+    out_ncols = out_ncols == nothing ? fill(1, ncol) : out_ncols
+    out_types = out_types == nothing ? fill(nothing, ncol) : out_types
+    @assert ncol == sum(out_ncols) string("Failed : ", ncol, " ", out_ncols)
+    res = Res(c, r, onecol, out_ncols, out_types)
     finalizer(res, finalize)
     err_msg = status(res)[2]
     isempty(err_msg) || error("Postgres said : $err_msg")
@@ -100,14 +106,27 @@ type Prepared
     prepared :: Bool
     singlecol :: Bool
     singlerow :: Bool
+    outs :: Vector
+    out_ncols :: Vector{Int}
+    out_types :: Vector{Union(Type, Nothing)}
 end
-Prepared(query, singlecol, singlerow) = begin
-    Prepared(query, "q_" * hex(hash(query)) * string(time()), false, singlecol, singlerow)
+Prepared(query, singlecol, singlerow, outs) = begin
+    Prepared(query, "q_" * hex(hash(query)) * string(time()), false, singlecol, singlerow, outs, Int[], Type[])
 end
 
 function prepare(c :: Conn, p :: Prepared)
     p.prepared && return
-    if run(c, "select count(*) from pg_prepared_statements where name = \$1", {p.name})[1][1] == 0
+    out_ncols_types = map(p.outs) do out
+        if isa(out, Expr) && out.head == :. && out.args[2] == :*
+            (length(Main.tablefields(out.args[1])), get(Main.rev_bindings, out.args[1], nothing))
+        else
+            (1,nothing)
+        end
+    end
+    p.out_ncols = map(first, out_ncols_types)
+    p.out_types = [x[2] for x in out_ncols_types]
+    cs = run(c, "select count(*) from pg_prepared_statements where name = \$1", {p.name})[1][1]
+    if cs == 0
         r = ccall((:PQprepare, "libpq"), Ptr{Void}, (Ptr{Void}, Ptr{Uint8}, Ptr{Uint8}, Int, Ptr{Oid}),
                   c.handle, p.name, p.query, 0, 0)
         pqres(c, r, false)
@@ -126,7 +145,7 @@ function run(c :: Conn, code :: Prepared, params :: Vector)
                           Ptr{Ptr{Uint8}}, Ptr{Int}, Ptr{Int}, Int),
               c.handle, code.name, length(params),
               pointer(map(pointer, vals)), pointer(map(length, vals)), pointer(zeros(length(params))), 1)
-    res = pqres(c, r, code.singlecol)
+    res = pqres(c, r, code.singlecol, code.out_ncols, code.out_types)
     code.singlerow ? res[1] : res
 end
 
@@ -198,8 +217,12 @@ function Base.getindex(r::Res, i :: Int, j :: Int)
     buf = IOBuffer(pointer_to_array(ptr, len))
     parse(field_type(r, j), r, i, j, buf)
 end
-Base.getindex(r::Res, i::Int) = r.singlecol ? r[i, 1] : ntuple(r.ncol, j -> r[i, j])
+maybetuple(::Nothing, x) = x
+maybetuple(::Nothing, xs...) = xs
+maybetuple(T,xs...) = T(xs...)
+Base.getindex(r::Res, i::Int) = r.singlecol ? r[i, 1] : ntuple(length(r.out_ncol_sum)-1, j -> maybetuple(r.out_types[j], r[i, r.out_ncol_sum[j]+1:r.out_ncol_sum[j+1]]...))
 Base.getindex(r::Res, I) = [r[i] for i in I]
+Base.getindex(r::Res, I, J) = [r[i,j] for i in I, j in J]
 Base.start(r::Res) = 1
 Base.next(r::Res,i) = (r[i], i+1)
 Base.done(r::Res,i) = i>length(r)
@@ -213,7 +236,7 @@ type Literal{T} <: TableExpr
     val :: T
 end
 
-capt(::Literal) = Set{Symbol}()
+capt(::Literal) = {}
 
 type JoinExpr <: TableExpr
     tables :: (TableExpr...,)
@@ -221,7 +244,7 @@ type JoinExpr <: TableExpr
     way :: Symbol # :left, :right, :in, :out, :cross
 end
 
-capt(j::JoinExpr) = union(map(capt, j.tables)...)
+capt(j::JoinExpr) = vcat(map(capt, j.tables)...)
 
 
 function join(tables...; condition = nothing, way = nothing)
@@ -237,7 +260,7 @@ type AliasExpr <: TableExpr
     name :: Symbol
     table :: Symbol
 end
-capt(a::AliasExpr) = Set({a.name})
+capt(a::AliasExpr) = {a}
 in(name :: Literal{Symbol}, table :: Literal{Symbol}) = AliasExpr(name.val, table.val)
 function in(name :: Literal{Symbol}, table :: Literal{Expr})
     e = table.val
@@ -289,17 +312,15 @@ selectone(args...; kws...) = select(args...; single_row = true, kws...)
 select(a, b; kws...) = error("What is this $a $b $kws")
 
 type Context
-    capt :: Set
+    capt :: Vector
     mappings :: Dict
     last :: Int
     singlecol :: Bool
     singlerow :: Bool
+    outs :: Vector
 end
 sql(c, lit :: Literal{Symbol}) = sql(c, lit.val)
 function sql(c, s::Symbol)
-    if !Base.in(s, c.capt)
-        warn("'$s' seems unsuned ...")
-    end
     string(s)
 end
 sql(c, s::Int) = string(s)
@@ -359,20 +380,53 @@ function sql(c, expr :: Expr)
     end
 end
 
+flatten_out(s::Symbol) = :($s.(*))
+function flatten_out(s::Expr)
+    if s.head == :quote s
+    elseif s.head == :. s
+    elseif s.head == :tuple Expr(:tuple, map(flatten_out, s.args)...)
+    else error("?? $s")
+    end
+end
+remove_alias(c, s) = s
+function remove_alias(capt, s::Expr)
+    if s.head == :.
+        alias = findfirst(x -> x.name == s.args[1], capt)
+        alias > 0 || error("unknown alias $alias")
+        Expr(:., capt[alias].table, s.args[2])
+    else s end
+end
+
 function sql(c, s :: Select)
     singlecol = !(isa(s.out, Expr) && s.out.head == :tuple)
-    singlecol &= s.out != Expr(:quote, :*)
+    singlecol &= s.out != Expr(:quote, :*)# || length(c.capt) == 1)
     c.singlecol = singlecol
     c.singlerow = s.singlerow
-    "select $(sql(c, s.out)) from $(sql(c, s.from))" *
+    if s.out == Expr(:quote, :*)
+        c.outs = map(x -> x.name, c.capt)
+    elseif isa(s.out, Symbol) || isa(s.out, Expr) && s.out.head == :.
+        c.outs = {s.out}
+    elseif isa(s.out, Expr) && s.out.head == :quote
+        c.outs = {s.out}
+    elseif isa(s.out, Expr) && s.out.head == :tuple
+        c.outs = s.out.args
+    else
+        dump(s.out)
+        error("What $(s.out) :: $(typeof(s.out)) is this")
+    end
+    s.out = flatten_out(s.out)
+    map!(flatten_out, c.outs)
+    map!(x -> remove_alias(c.capt, x), c.outs)
+    q = "select $(sql(c, s.out)) from $(sql(c, s.from))" *
     (s.filter == nothing ? "" : " where $(sql(c, s.filter))") *
     (s.sort == nothing ? "" : " order by $(sql(c, s.sort))")
+    q
 end
 result(q :: Pg.Prepared, args) = Pg.run(Pg.conn(), q, args)
 macro sql(stx)
     q = parse(stx)
-    c = Context(push!(capt(q), :*), Dict(), 0, false, false)
-    qs = Pg.Prepared(sql(c, q), c.singlecol, c.singlerow)
+    c = Context(capt(q), Dict(), 0, false, false, {})
+    qs = Pg.Prepared(sql(c, q), c.singlecol, c.singlerow, c.outs)
     vs = collect(keys(c.mappings))
     sort!(vs, by=x->c.mappings[x])
     rx = :(Query.result($qs, {$(map(esc, vs)...)}))
@@ -423,6 +477,7 @@ type TableBinding
     col_map :: Vector{Int}
 end
 const bindings = Dict{Type, TableBinding}()
+const rev_bindings = Dict{Symbol, Type}()
 function bind(t::Type, table :: Symbol)
     tn = names(t)
     tbn = tablefields(table)
@@ -454,6 +509,7 @@ function bind(t::Type, table :: Symbol)
     Pg.oid_to_julia[ty_oid] = t
     b = TableBinding(t, table, tuple(map(x->x[2], tbn)...), field_map, col_map)
     bindings[t] = b
+    rev_bindings[table] = t
     b
 end
 
@@ -465,8 +521,13 @@ Pg.connect((String=>String)[]) do
                     out = (a, a.x))
     print("X $(x)")
     bind(A, :aa)
+    x = @sql selectone(a in aa, filter = a.x == $u)
+    println(x)
     x = @sql selectone(a in aa, filter = a.x == $u, out = a)
     println(x)
-    x = @sql find(a in aa, a.x == $u, out = (a,a.x,a))
-    print(x)
+    x = @sql selectone(a in aa, filter = a.x == $u, out=a)
+    println(x)
+
+#    x = @sql find(a in aa, a.x == $u, out = (a,a.x,a))
+#    print(x)
 end
