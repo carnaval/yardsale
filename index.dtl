@@ -1,10 +1,36 @@
 <html>
 <head>
 <title>$page_title</title>
+<script src="//ajax.googleapis.com/ajax/libs/jquery/1.11.0/jquery.min.js"></script>
+<script>
+var req; var data = [];
+
+function g() {
+  
+}
+
+function f() {
+  req = $$.ajax({url: '/js', method: 'GET',
+    complete: function(req, stat) {
+      stat == 'success' || stat == 'abort' || console.log(stat + ' : ' + JSON.stringify(req));
+      $.foreach(data, g);
+      data = [];
+    }
+  });
+}
+$$(document).ready(function() {
+$$('#abort').click(function() {
+  event.preventDefault();
+  console.log('Aborting : ' + req);
+  req.abort();
+});
+});
+$$(document).ready(f);
+</script>
 </head>
 <body>
 <h3>$page_title</h3>
-Hi !
+Hi ! <a href="" onclick="req.abort();">abort</a>
 <ul>
 #(for route in routes)
    #(route_ast = methods(route[3]).defs.func.code)      

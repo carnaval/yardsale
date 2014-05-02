@@ -84,7 +84,7 @@ function read_http_req(io :: IO)
     end
 end
 
-normalize_path(p) = (while endswith(p, "/"); p = p[1:end-1] end; p) # haha
+normalize_path(p) = p#(while endswith(p, "/"); p = p[1:end-1] end; p) # haha
 
 
 function parse_uri(x :: ASCIIString)
@@ -182,10 +182,8 @@ function ok(c, s, mime)
     response(c, 200, "OK", s, [Header("Content-Type", mime)])
 end
 
-function internal_error(c, s::String)
-    response(c, 500, "Internal server error", IOBuffer(s))
-end
-
+internal_error(c, io :: IO) = response(c, 500, "Internal server error", io)
+internal_error(c, s :: String) = internal_error(c, IOBuffer(s))
 function ok(c, s::String; mime = "text/plain")
     ok(c, IOBuffer(s), mime)
 end
@@ -195,6 +193,8 @@ function not_found(c, s::String)
 end
 
 routes = {}
+
+
 
 function serve_conn(c)
     while !eof(c)
@@ -207,7 +207,14 @@ function serve_conn(c)
                     route[3](c, req, m.captures...)
                     found = true
                 catch x
-                    internal_error(c, "Exception : $x")
+                    resp = IOBuffer()
+                    println(resp, "Exception : $x")
+                    println(resp, "Req : $req")
+                    println(resp, "Route : $(route[1])")
+                    println(resp, "Parameters : $(m.captures)")
+                    print(resp, "Backtrace :")
+                    Base.show_backtrace(resp, catch_backtrace())
+                    internal_error(c, seekstart(resp))
                 end
                 break
             end
@@ -327,6 +334,13 @@ include("dtl.jl")
                 page_title = string(x),
                 routes = Http.routes),
             "text/html")
+end
+
+@resource GET "/js" begin
+    sleep(5)
+    Http.ok(io,
+            IOBuffer("console.log('Hello from julia')"),
+            "application/javascript")
 end
 
 Http.serve(8080)

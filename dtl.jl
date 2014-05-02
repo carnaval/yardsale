@@ -18,7 +18,7 @@ function freevars(lsd :: LambdaStaticData)
     filter!(x -> !isdefined(x), vars)
 end
 
-freevars(stx) = freevars(eval(:(()->($stx))).code)
+freevars(stx) = (println(stx); freevars(eval(:(()->($stx))).code))
 
 function dtl2jl(funname, stx)
     idx = 0
@@ -26,15 +26,21 @@ function dtl2jl(funname, stx)
     write(source, "begin;")
     echoed = 1
     while true
-        dollar_idx = search(stx, '$', idx + 1)
-        pound_idx = search(stx, '#', idx + 1)
+        dollar_idx = search(stx, '$', idx+1)
+        while stx[dollar_idx+1] == '$'
+            dollar_idx = search(stx, '$', dollar_idx+2)
+        end
+        pound_idx = search(stx, '#', idx+1)
+        while stx[pound_idx+1] == '#'
+            pound_idx = search(stx, '#', pount_idx+2)
+        end
         if dollar_idx == 0 dollar_idx = typemax(Int) end
         if pound_idx == 0 pound_idx = typemax(Int) end
         idx = min(dollar_idx, pound_idx)
         literal = stx[echoed:(idx == typemax(Int) ? length(stx) : (idx-1))]
         if length(literal) > 0
             write(source, "@echo ")
-            show(source, literal)
+            show(source, replace(literal, "\$\$", "\$"))
             write(source, ";")
         end
         idx < length(stx) || break
