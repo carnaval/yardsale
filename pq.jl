@@ -136,7 +136,7 @@ end
 
 function run(c :: Conn, code :: Prepared, params :: Vector)
     prepare(c, code)
-    println("SQL: $(code.query) | \$=$params")
+#    println("SQL: $(code.query) | \$=$params")
     vals = convert(Vector{Vector{Uint8}},
                    map(x -> convert(Vector{Uint8}, utf8(string(x))),
                        params))
@@ -162,7 +162,10 @@ const oid_to_julia =
      oid(23) => Int32,
      oid(25) => String,
      oid(26) => Oid,
-     oid(705) => String]
+     oid(705) => String,
+     oid(1005) => Vector{Int16},
+     oid(1007) => Vector{Int32},
+     oid(1028) => Vector{Oid}]
 const julia_to_oid = [ v => k for (k,v) in oid_to_julia ]
 
 function field_type_oid(r :: Res, i :: Int)
@@ -209,6 +212,18 @@ function parse(::Type{Vector{Uint8}}, res :: Res, i :: Int, j :: Int, io::IOBuff
 #    read(io, Uint8, len)
     error()
 end
+function parse{T}(::Type{Vector{T}}, res :: Res, i :: Int, j :: Int, io :: IOBuffer)
+    ndim = parse(Int32, res, i, j, io)
+    offs = parse(Int32, res, i, j, io)
+    elt_oid = parse(Int32, res, i, j, io)
+    elt = oid_type(elt_oid)
+    len = parse(Int32, res, i, j, io)
+    lb = parse(Int32, res, i, j, io)
+    ndim == 1 || error("no multidimensional array yet : $ndim")
+    offs == 0 || error("no NULL bitmap yet : $offs")
+    # TODO figure out what is this int32 doing here
+    T[(read(io, Int32); parse(elt, res, i, j, io)) for _=1:len]
+end
 
 Base.length(r::Res) = ccall((:PQntuples, "libpq"), Int, (Ptr{Void},), r.handle)
 function Base.getindex(r::Res, i :: Int, j :: Int)
@@ -231,30 +246,32 @@ end
 module Query
 using Pg
 abstract TableExpr
-
+typealias Stx Union(Symbol, Expr)
 type Literal{T} <: TableExpr
     val :: T
 end
 
 capt(::Literal) = {}
+capt(::Expr) = {}
 
 type JoinExpr <: TableExpr
     tables :: (TableExpr...,)
-    condition :: Union(Literal{Expr}, Nothing)
+    condition :: Union(Stx, Nothing)
     way :: Symbol # :left, :right, :in, :out, :cross
 end
 
 capt(j::JoinExpr) = vcat(map(capt, j.tables)...)
 
 
-function join(tables...; condition = nothing, way = nothing)
-    if way == nothing
-        way = Literal(condition == nothing ? :cross : :in)
-    end
+function join(tables...; condition = Literal(nothing), way = Literal(nothing))
     w = way.val
+    cond = condition.val
+    if w == nothing
+        w = cond == nothing ? :cross : :in
+    end
     (w == :cross || length(tables) <= 2) || error("only cross join supports > 2 tables")
-    (w == :cross || condition != nothing) || error("only cross join are unconditional")
-    JoinExpr(tables, condition, w)
+    (w == :cross || cond != nothing) || error("only cross join are unconditional")
+    JoinExpr(tables, cond, w)
 end
 type AliasExpr <: TableExpr
     name :: Symbol
@@ -271,14 +288,18 @@ function in(name :: Literal{Symbol}, table :: Literal{Expr})
     end
 end
 
-desc(x :: Literal{Expr}) = Literal(Expr(:desc, x.val))
+desc(x :: Literal) = Literal(Expr(:desc, x.val))
 asc(x) = x
 
 function parse(stx)
     if isa(stx, Expr)
         if stx.head == :call
             args = map(parse, stx.args[2:end])
-            eval(Expr(:call, stx.args[1], args...))
+            if Base.in(stx.args[1], names(Query, true))
+                eval(Query, Expr(:call, stx.args[1], args...))
+            else
+                Literal(Expr(:call, stx.args[1], args...))
+            end
         elseif stx.head == :in
             parse(Expr(:call, :in, stx.args...))
         elseif stx.head == :kw
@@ -291,11 +312,26 @@ function parse(stx)
     end
 end
 
+#=
+type Thing frob :: One{Frob}; end
+- for all (blah in some_things_table) in from clause
+- all usages blah.frob => blah.frob_id, blah.frob.id => blah.frob_id
+- blah.frob.X => _blah_frob.X
+- in that case, in the from : (blah in some_things_table) => join(blah in some_things_table, _blah_frob in some_frob_table (which one ?), cond = blah.frob_id = _blah_frob.id)
+=#
+type One{T,pkT}
+    pk :: pkT
+    _data :: T
+    One(pk) = new(pk)
+end
+
+
+
 type Select
     from :: TableExpr
     filter :: Union(Expr, Nothing)
-    sort :: Union(Expr, Nothing)
-    out :: Expr
+    sort :: Union(Stx, Nothing)
+    out :: Stx
     singlerow :: Bool
 end
 
@@ -304,8 +340,8 @@ type Insert
 end
 
 capt(s::Select) = capt(s.from)
-function select(from :: TableExpr; filter = Literal(nothing), sort = Literal(nothing), out = Literal(Expr(:quote, :*)), single_row=false)
-    Select(from, filter.val, sort.val, isa(out.val, Symbol) ? Expr(:quote, out.val) : out.val, single_row)
+function select(from :: TableExpr; filter = Literal(nothing), sort = Literal(nothing), out = Literal(:*), single_row=false)
+    Select(from, filter.val, sort.val, out.val, single_row)
 end
 find(from, filter; kws...) = select(from; filter = filter, kws...)
 selectone(args...; kws...) = select(args...; single_row = true, kws...)
@@ -362,11 +398,9 @@ function sql(c, expr :: Expr)
     elseif expr.head == :call
         if expr.args[1] == :!
             "not ($(sql(c, expr.args[2])))"
-        else
-            "??[$expr]"
+        else # TODO check for allowed functions ?
+            "$(expr.args[1])($(sql(c, Expr(:tuple, expr.args[2:end]...))))"
         end
-#    elseif expr.head == :quote
-#        sql(c, eval(expr))
     elseif expr.head == :desc
         "$(sql(c, expr.args[1])) desc"
     elseif expr.head == :$
@@ -382,10 +416,9 @@ end
 
 flatten_out(s::Symbol) = :($s.(*))
 function flatten_out(s::Expr)
-    if s.head == :quote s
-    elseif s.head == :. s
+    if s.head == :. s
     elseif s.head == :tuple Expr(:tuple, map(flatten_out, s.args)...)
-    else error("?? $s")
+    else s
     end
 end
 remove_alias(c, s) = s
@@ -399,14 +432,13 @@ end
 
 function sql(c, s :: Select)
     singlecol = !(isa(s.out, Expr) && s.out.head == :tuple)
-    singlecol &= s.out != Expr(:quote, :*)# || length(c.capt) == 1)
+    singlecol &= s.out != :*# || length(c.capt) == 1)
     c.singlecol = singlecol
     c.singlerow = s.singlerow
-    if s.out == Expr(:quote, :*)
+    if s.out == :*
         c.outs = map(x -> x.name, c.capt)
-    elseif isa(s.out, Symbol) || isa(s.out, Expr) && s.out.head == :.
-        c.outs = {s.out}
-    elseif isa(s.out, Expr) && s.out.head == :quote
+        s.out = Expr(:tuple, c.outs...)
+    elseif isa(s.out, Symbol) || (isa(s.out, Expr) && (s.out.head == :. || s.out.head == :call))
         c.outs = {s.out}
     elseif isa(s.out, Expr) && s.out.head == :tuple
         c.outs = s.out.args
@@ -446,6 +478,9 @@ function discover_oid(c, o)
                          condition = cl.oid == attr.attrelid),
                     filter = ty.oid == $o && ty.typtype == 'c' && attr.attnum > 0,
                     out = attr.atttypid)
+    if length(r) == 0
+        error("Unknown OID $o")
+    end
     types = map(x -> Pg.oid_type(c, Pg.oid(x[1])), r |> collect)
     Pg.oid_to_julia[o] = tuple(types...)
 end
@@ -461,12 +496,12 @@ function tablefields(table_name)
         (symbol(name), Pg.oid_type(ty))
     end)
 end
-
-type A
-    x :: Int32
-    plop :: String
+immutable Pk{T}
+    val :: T
 end
-
+Base.convert{T}(::Type{T}, pk::Pk{T}) = pk.val
+Base.convert{pkT}(::Type{Pk{pkT}}, ::Pk) = error()
+Base.convert{pkT, T}(::Type{Pk{pkT}}, v::T) = Pk(convert(pkT, v))
 type TableBinding
     row_type :: Type
     table :: Symbol
@@ -475,6 +510,9 @@ type TableBinding
     field_map :: Vector{Int}
     # reverse
     col_map :: Vector{Int}
+    # primary key position in T and table, or 0
+    pk_field :: Int
+    pk_col :: Int
 end
 const bindings = Dict{Type, TableBinding}()
 const rev_bindings = Dict{Symbol, Type}()
@@ -490,16 +528,39 @@ function bind(t::Type, table :: Symbol)
             error("Binding error: cannot convert $ft ($t) => $(tbn[i][2]) ($table).")
         end
     end
+    t_pk_ind = 0
     col_map = [findfirst(map(first, tbn), t_field)
                for t_field in tn]
     for i = 1:length(tn)
+        if t.types[i] <: Pk
+            if col_map[i] == 0
+                error("Primary key $(tn[i]) in $t does not exist in the table $table.")
+            end
+            if t_pk_ind > 0
+                error("Cannot have more than one primary key. In $t : $(tn[t_pk_ind]) and $(tn[i]).")
+            end
+            t_pk_ind = i
+        end
         col_map[i] > 0 || continue
         colt = tbn[col_map[i]][2]
         if !method_exists(convert, (Type{colt}, t.types[i]))
             error("Binding error: cannot convert $colt ($table) => $(tn[i]) ($t).")
         end
     end
-    tn = string(table)
+
+    if t_pk_ind > 0
+        res = @sql select(join(cl in pg_catalog.pg_class,
+                         cs in pg_catalog.pg_constraint,
+                         condition = cl.oid == cs.conrelid),
+                    filter = cl.relname == $(string(table)) && cs.contype == 'p',
+                    out = cs.conkey)
+        length(res) > 0 || error("Table $table has no primary key but $t has one : $(tn[t_pk_ind])")
+        pkey = res[1]
+        length(pkey) == 1 || error("We do not support yet pkey on multiple columns : $pkey")
+        pkey = pkey[1]
+        pkey == col_map[t_pk_ind] || error("Mismatch in pkey column. Declaared $(col_map[t_pk_ind]) in $t, got $pkey in $table")
+    end
+
     r = @sql select(join(ty in pg_catalog.pg_type,
                          cl in pg_catalog.pg_class,
                          condition = ty.typrelid == cl.oid),
@@ -507,27 +568,52 @@ function bind(t::Type, table :: Symbol)
                     out = ty.oid)
     ty_oid = Pg.oid(r[1][1])
     Pg.oid_to_julia[ty_oid] = t
-    b = TableBinding(t, table, tuple(map(x->x[2], tbn)...), field_map, col_map)
+    b = TableBinding(t, table, tuple(map(x->x[2], tbn)...), field_map, col_map, t_pk_ind, t_pk_ind > 0 ? col_map[t_pk_ind] : 0)
     bindings[t] = b
     rev_bindings[table] = t
     b
 end
+type A
+    x :: Int
+    plop :: String
+end
+type P
+    id :: Pk{Int}
+    y :: Int
+#    z :: Pk{Int}
+end
+#=type Ad
+    id :: Pk{Int}
+    p :: One{P}
+    z :: Int
+end=#
 
 Pg.connect((String=>String)[]) do
     println("Status : ", Pg.status(Pg.conn()))
+    x = Pg.run(Pg.conn(), "select '{1,2,3,4,5}' :: int2[]", {})
+    println(x)
+    x = Pg.run(Pg.conn(), "select '{1,2,3,4,5}' :: int4[]", {})
+    println(x)
+    x = Pg.run(Pg.conn(), "select '{1,2,3,4,5}' :: oid[]", {})
+    println(x)
     u = int32(3)
     x = @sql select(a in aa,
                     filter = a.x == $u,
-                    out = (a, a.x))
-    print("X $(x)")
+                    out = a.x)
+    print("X $(x.out_types) $(x)")
+    bind(P, :pp2)
     bind(A, :aa)
+    x = @sql select(p in pp)
+    println(x)
+    exit()
     x = @sql selectone(a in aa, filter = a.x == $u)
     println(x)
     x = @sql selectone(a in aa, filter = a.x == $u, out = a)
     println(x)
     x = @sql selectone(a in aa, filter = a.x == $u, out=a)
     println(x)
-
-#    x = @sql find(a in aa, a.x == $u, out = (a,a.x,a))
-#    print(x)
+    for i=1:10
+    x = @sql find(a in aa, a.x >= $u, out = (a, least(a.x, 0), a))
+    print(x)
+    end
 end

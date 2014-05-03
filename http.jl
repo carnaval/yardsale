@@ -28,7 +28,13 @@ type Req
     
     headers :: Headers
     body :: IO
+
+    cookies :: Dict{String, String}
+    Req(meth, path, v, hds, io) = Req(meth, path, v, hds, io, headers_cookies(hds))
 end
+
+parse_cookies(str) = map(kv -> tuple(split(kv, '=')[1:2]...), split(str, ';'))
+headers_cookies(hs :: Headers) = Dict(vcat(map(parse_cookies, filter(h -> h.name == "Cookie", hs))...))
 
 type Resp
     code :: Int
@@ -167,7 +173,7 @@ get(url) = request(:GET, url)
 
 function get_string(url :: ASCIIString)
     resp = get(url)
-    (resp, bodystring(resp))
+    resp, bodystring(resp)
 end
 
 function get_file(url :: ASCIIString, fn)
@@ -193,8 +199,6 @@ function not_found(c, s::String)
 end
 
 routes = {}
-
-
 
 function serve_conn(c)
     while !eof(c)
@@ -335,7 +339,7 @@ include("dtl.jl")
                 routes = Http.routes),
             "text/html")
 end
-
+js"console.log($a)"
 @resource GET "/js" begin
     sleep(5)
     Http.ok(io,
